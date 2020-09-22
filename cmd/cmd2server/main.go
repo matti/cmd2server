@@ -1,18 +1,26 @@
 package main
 
 import (
-	"io"
 	"log"
 	"net"
 	"os"
-	"os/exec"
+	"os/signal"
 	"syscall"
 	"time"
+
+	cmd2server "github.com/matti/cmd2server/internal"
 )
 
 func main() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+	go func() {
+		s := <-sigChan
+		log.Printf("got signal %d, exit", s)
+		os.Exit(0)
+	}()
+
 	listen := os.Args[1]
-	command := os.Args[2:]
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -20,38 +28,23 @@ func main() {
 	}
 
 	for {
-		log.Printf("waiting for connection at %s", listen)
+		log.Printf("PID %d waiting for connection at %s", os.Getpid(), listen)
 
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("accepted connection from %s", conn.RemoteAddr())
+
+		command := cmd2server.NewCommand(os.Args[2:])
 		handle(conn, command)
+		command.Cleanup()
 		conn.Close()
 	}
 }
 
-func handle(conn net.Conn, command []string) {
-	name := command[0]
-	args := command[1:]
-
-	log.Printf("exec %s with args %s", name, args)
-	cmdReader, cmdWriter := io.Pipe()
-
-	mw := io.MultiWriter(cmdWriter, os.Stdout)
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = mw
-	cmd.Stderr = mw
-	err := cmd.Start()
-
-	if err != nil {
-		log.Fatalf("command start error %s", err)
-	}
-
+func handle(conn net.Conn, command *cmd2server.Command) {
 	clientLostChan := make(chan bool)
-	processExitChan := make(chan bool)
-
 	go func(done chan bool) {
 		buf := make([]byte, 1)
 		for {
@@ -64,11 +57,16 @@ func handle(conn net.Conn, command []string) {
 		done <- true
 	}(clientLostChan)
 
+	err := command.Start()
+	if err != nil {
+		log.Fatalf("command start error %s", err)
+	}
+
 	go func() {
 		for {
 			// TODO: buffer "clips" if outside of for ?
 			buf := make([]byte, 4096)
-			_, err := cmdReader.Read(buf)
+			_, err := command.Reader.Read(buf)
 			if err != nil {
 				break
 			}
@@ -79,26 +77,13 @@ func handle(conn net.Conn, command []string) {
 				break
 			}
 		}
-
 	}()
 
-	go func(done chan bool) {
-		cmd.Wait()
-		processExitChan <- true
-	}(processExitChan)
-
 	select {
-	case <-processExitChan:
-		log.Printf("process exited")
+	case <-command.Done:
+		log.Println("command done")
 	case <-clientLostChan:
-		log.Printf("client lost, killing PID %d with signal %s", cmd.Process.Pid, "SIGTERM")
-		syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
+		log.Println("client lost")
+		command.Stop()
 	}
-
-	cmd.Wait()
-	log.Printf("PID %d exited with %d", cmd.Process.Pid, cmd.ProcessState.ExitCode())
-
-	cmdReader.Close()
-	cmdWriter.Close()
-	conn.Close()
 }
