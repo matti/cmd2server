@@ -12,11 +12,17 @@ import (
 )
 
 func main() {
+	var command *cmd2server.Command
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM)
 	go func() {
 		s := <-sigChan
-		log.Printf("got signal %d, exit", s)
+		log.Printf("got signal %d", s)
+		if command != nil {
+			command.Stop()
+		}
+		log.Println("cmd2server will now exit with 0")
 		os.Exit(0)
 	}()
 
@@ -36,7 +42,7 @@ func main() {
 		}
 		log.Printf("accepted connection from %s", conn.RemoteAddr())
 
-		command := cmd2server.NewCommand(os.Args[2:])
+		command = cmd2server.NewCommand(os.Args[2:])
 		handle(conn, command)
 		command.Cleanup()
 		conn.Close()
