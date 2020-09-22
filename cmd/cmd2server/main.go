@@ -49,43 +49,56 @@ func handle(conn net.Conn, command []string) {
 		log.Fatalf("command start error %s", err)
 	}
 
-	go func() {
-		cmd.Wait()
-		// releases the blocking for loop
-		cmdReader.Close()
-	}()
+	clientLostChan := make(chan bool)
+	processExitChan := make(chan bool)
 
-	go func() {
+	go func(done chan bool) {
 		buf := make([]byte, 1)
 		for {
 			_, err := conn.Read(buf)
 			if err != nil {
-				conn.Close()
-				return
+				break
 			}
 		}
+
+		done <- true
+	}(clientLostChan)
+
+	go func() {
+		for {
+			// TODO: buffer "clips" if outside of for ?
+			buf := make([]byte, 4096)
+			_, err := cmdReader.Read(buf)
+			if err != nil {
+				break
+			}
+
+			conn.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+			_, err = conn.Write(buf)
+			if err != nil {
+				break
+			}
+		}
+
 	}()
 
-	for {
-		// TODO: buffer "clips" if outside of for ?
-		buf := make([]byte, 4096)
-		_, err := cmdReader.Read(buf)
-		if err != nil {
-			log.Printf("read err %s", err)
-			break
-		}
-		conn.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
-		_, err = conn.Write(buf)
-		if err != nil {
-			log.Printf("write err %s", err)
-			break
-		}
+	go func(done chan bool) {
+		cmd.Wait()
+		processExitChan <- true
+	}(processExitChan)
+
+	select {
+	case <-processExitChan:
+		log.Printf("process exited")
+	case <-clientLostChan:
+		log.Printf("client lost, killing PID %d with signal %s", cmd.Process.Pid, "SIGTERM")
+		syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
 	}
 
-	// can not use cmd.ProcessState because it's most likely nil in many cases until exited, so killing anyway
-	log.Printf("killing PID %d with signal %s", cmd.Process.Pid, "SIGTERM")
-	syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
+	cmd.Wait()
 	log.Printf("PID %d exited with %d", cmd.Process.Pid, cmd.ProcessState.ExitCode())
 
+	cmdReader.Close()
+	cmdWriter.Close()
 	conn.Close()
 }
